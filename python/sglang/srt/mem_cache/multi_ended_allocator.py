@@ -2755,6 +2755,17 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     of their own (independent) virtual-id spaces.
     """
 
+    # UnifiedRadixCache uses this explicit capability flag before enabling the
+    # FULL <-> MAMBA peer-eviction fallback.  Keep it on the two-pool Kimi
+    # allocator only; the three-pool MAMBA/SWA/FULL layout needs its own policy.
+    supports_full_mamba_cross_reclaim = True
+
+    # Adaptive memory: cache_unfinished_req temporarily needs one replacement
+    # slot before the previous radix checkpoint is unlocked.  Keeping one slot
+    # of joint capacity avoids an allocation failure when all steady-state
+    # request slots are still protected.
+    mamba_runtime_headroom_slots = 1
+
     def __init__(
         self,
         *,
@@ -2883,6 +2894,43 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             -self.mamba_allocator.entry_bytes_per_page
             * get_parallel().attn_dcp_size
             // self.full_attn_allocator.entry_bytes
+        )
+
+    def full_virtual_available_size(self) -> int:
+        """FULL capacity allowed by its virtual IDs, ignoring shared bytes."""
+        allocator = self.full_attn_allocator
+        return len(allocator.free_virtual_ids) * allocator.page_size
+
+    def mamba_virtual_available_size(self) -> int:
+        """MAMBA capacity allowed by its virtual IDs, ignoring shared bytes."""
+        allocator = self.mamba_allocator
+        return len(allocator.free_virtual_ids) * allocator.page_size
+
+    def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
+        """Keep the transient Mamba checkpoint slot available during decode."""
+        if not tree_cache.supports_mamba():
+            return super().check_decode_capacity(
+                num_tokens=num_tokens, tree_cache=tree_cache
+            )
+
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        headroom_slots = self.mamba_runtime_headroom_slots
+        required_full = (
+            num_tokens + headroom_slots * self.mamba_slot_full_token_cost()
+        )
+        self.evict_to_free_tokens(tree_cache, required_full)
+
+        mamba_available = self.mamba_allocator.schedulable_available_size()
+        if mamba_available < headroom_slots:
+            tree_cache.evict_for_alloc(
+                EvictParams(mamba_num=headroom_slots - mamba_available)
+            )
+
+        return (
+            self.available_size() >= required_full
+            and self.mamba_allocator.schedulable_available_size()
+            >= headroom_slots
         )
 
     @property

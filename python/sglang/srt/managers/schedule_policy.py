@@ -563,13 +563,36 @@ class PrefillAdder:
             self._mamba_slot_cost = (
                 self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
             )
+        self._adaptive_full_mamba = (
+            getattr(
+                self.token_to_kv_pool_allocator,
+                "supports_full_mamba_cross_reclaim",
+                False,
+            )
+            is True
+        )
 
-        # `mamba_gap_reserve` is charged to `rem_total_tokens`, which INCLUDES
-        # `full_evictable_size()` — but `alloc_req_slots` can only recover
-        # MAMBA-recoverable bytes for a mamba slot (shared gap + peer holes +
-        # mamba-evictable radix), NOT full-evictable. Gate new mamba slots on
-        # that mamba-recoverable budget separately or an over-admit hits the
-        # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
+        # Adaptive memory: Kimi's unfinished-cache path allocates a replacement
+        # Mamba slot before releasing the old radix lock.  Reserve one shared
+        # slot globally; the allocator's decode gate preserves the same room.
+        self._mamba_runtime_headroom_slots = 0
+        if self.is_hybrid_ssm_cache and self._adaptive_full_mamba:
+            self._mamba_runtime_headroom_slots = int(
+                getattr(
+                    self.token_to_kv_pool_allocator,
+                    "mamba_runtime_headroom_slots",
+                    0,
+                )
+            )
+        mamba_runtime_headroom = (
+            self._mamba_runtime_headroom_slots * self._mamba_slot_cost
+        )
+        self.rem_total_token_offset += mamba_runtime_headroom
+        self.cur_rem_token_offset += mamba_runtime_headroom
+
+        # Keep an independent slot-count gate because shared bytes cannot create
+        # missing Mamba virtual IDs. FULL cache is intentionally not credited
+        # here; cross-component eviction remains a runtime fallback.
         self.rem_mamba_slots = None
         if self._mamba_slot_cost:
             self.rem_mamba_slots = (
@@ -577,6 +600,7 @@ class PrefillAdder:
             )
             if self.is_hybrid_ssm_cache:
                 self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
+            self.rem_mamba_slots -= self._mamba_runtime_headroom_slots
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -790,19 +814,50 @@ class PrefillAdder:
         )
 
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
-        """Shared-gap reservation (full-token-equivalents) for a request's new
-        mamba state. Charged only on the SHARED Mamba pool (`_mamba_slot_cost > 0`)
-        and only when the req has no state yet (`mamba_pool_idx is None`, mirroring
-        `HybridReqToTokenPool.alloc`); 0 keeps baseline / SWA / non-Mamba unchanged.
+        """Joint-memory cost of the Mamba slots this request still needs."""
+        if not self._mamba_slot_cost:
+            return 0
+        if not self._adaptive_full_mamba:
+            return self._mamba_slot_cost if not req.kv.holds_mamba else 0
 
-        Conservative by design (`_mamba_slot_cost` rounds UP). Does NOT reserve
-        radix COW headroom or locked-but-evictable bytes — that residual is
-        backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
-        over-admission crashes under pressure, make this more conservative (e.g.
-        multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
-        if self._mamba_slot_cost and not req.kv.holds_mamba:
-            return self._mamba_slot_cost
-        return 0
+        slots = 0
+        needs_new_mamba_state = (
+            not req.kv.holds_mamba
+            or getattr(req.kv, "mamba_cow_src_index", None) is not None
+        )
+        if needs_new_mamba_state:
+            slots += 1
+
+        if (
+            self.is_hybrid_ssm_cache
+            and self.tree_cache.enable_mamba_extra_buffer
+            and req.kv.mamba_ping_pong_track_buffer is None
+        ):
+            req_pool = self.tree_cache.req_to_token_pool
+            slots += (
+                1
+                if req_pool.enable_mamba_extra_buffer_lazy
+                else req_pool.mamba_ping_pong_track_buffer_size
+            )
+
+        # Adaptive memory: charge either the first donated radix checkpoint or
+        # the matched checkpoint that this new COW request is about to lock.
+        # Later replacements use the single global runtime headroom.
+        if (
+            needs_new_mamba_state
+            and self.is_hybrid_ssm_cache
+            and getattr(self.tree_cache.req_to_token_pool, "mamba_ckpt_pool", None)
+            is None
+        ):
+            slots += 1
+
+        return slots * self._mamba_slot_cost
+
+    def _mamba_req_fits(self, req: Req) -> bool:
+        if self.rem_mamba_slots is None:
+            return True
+        needed = self._mamba_gap_budget_for_req(req) // self._mamba_slot_cost
+        return needed <= self.rem_mamba_slots
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -811,8 +866,8 @@ class PrefillAdder:
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
             no_token = self.rem_swa_tokens <= 0
-        # Gate new mamba slots separately: rem_total_tokens' full_evictable can't
-        # cover a mamba slot, which needs mamba-recoverable bytes (see __init__).
+        # Gate new Mamba slots separately because peer eviction can free shared
+        # bytes but cannot create Mamba virtual IDs.
         if not no_token and self.rem_mamba_slots is not None:
             no_token = self.rem_mamba_slots <= 0
         if no_token:
@@ -855,10 +910,11 @@ class PrefillAdder:
         self.cur_rem_token_offset += (
             extend_input_len + page_overhead + mamba_gap_reserve
         )
-        # The new mamba slot also consumes one mamba-recoverable slot (gated
-        # separately so full_evictable can't cover it — see __init__).
+        # Adaptive memory: reserve the exact number of Mamba slots encoded in
+        # the full-token-equivalent budget, rather than assuming one per req.
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
-            self.rem_mamba_slots -= 1
+            reserved_slots = mamba_gap_reserve // self._mamba_slot_cost
+            self.rem_mamba_slots -= reserved_slots
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
@@ -1188,6 +1244,9 @@ class PrefillAdder:
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
+
+        if not self._mamba_req_fits(req):
+            return AddReqResult.NO_TOKEN
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
