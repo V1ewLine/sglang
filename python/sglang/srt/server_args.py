@@ -1451,6 +1451,14 @@ class ServerArgs:
     # Logging, metrics, and tracing
     # -------------------------------------------------------------------------
     log_level: A[str, "The logging level of all loggers.", NS("observability")] = "info"
+    unified_memory_log_rank_scope: A[
+        str,
+        Arg(
+            help="Ranks that emit Unified Memory logs: 'tp0' logs only on tensor-parallel rank 0; 'all' logs on every tensor-parallel rank.",
+            choices=["tp0", "all"],
+        ),
+        NS("observability"),
+    ] = "tp0"
     log_level_http: A[
         Optional[str],
         "The logging level of HTTP server. If not set, reuse --log-level by default.",

@@ -309,6 +309,7 @@ from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
     configure_logger,
+    configure_unified_memory_rank_logging,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -5522,6 +5523,10 @@ def configure_scheduler_process(
 
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
+    configure_unified_memory_rank_logging(
+        tp_rank=tp_rank,
+        rank_scope=server_args.unified_memory_log_rank_scope,
+    )
     suppress_other_loggers()
 
     # Set cpu affinity to this gpu process

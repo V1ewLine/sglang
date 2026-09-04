@@ -641,14 +641,6 @@ class UnifiedRadixCache(BasePrefixCache):
             self._component_available_size(component_type) >= required
             for component_type, required in available_size_targets.items()
         )
-        if allocation_possible:
-            tp_group = getattr(self, "tp_group", None)
-            if (
-                tp_group is not None
-                and torch.distributed.is_initialized()
-                and torch.distributed.get_rank(group=tp_group) != 0
-            ):
-                return
 
         request_parts = []
         if params.num_tokens > 0:

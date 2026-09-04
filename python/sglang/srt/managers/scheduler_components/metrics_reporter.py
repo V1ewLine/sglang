@@ -599,6 +599,13 @@ class SchedulerMetricsReporter:
             f"Mamba={pool_stats.mamba_evictable_size or 0} slots",
         ]
 
+    def _log_unified_memory_on_all_ranks(self) -> bool:
+        allocator = self.scheduler.token_to_kv_pool_allocator
+        return (
+            getattr(allocator, "supports_full_mamba_cross_reclaim", False)
+            and get_observability().unified_memory_log_rank_scope == "all"
+        )
+
     def reset_metrics(self):
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
@@ -616,9 +623,11 @@ class SchedulerMetricsReporter:
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
     ):
+        log_unified_memory_on_all_ranks = self._log_unified_memory_on_all_ranks()
         if (
             not self.is_stats_logging_rank
             and not self.current_scheduler_metrics_enabled
+            and not log_unified_memory_on_all_ranks
         ):
             return
 
@@ -724,7 +733,7 @@ class SchedulerMetricsReporter:
         if ENABLE_METRICS_DEVICE_TIMER and not unified_memory_log_parts:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
-        if self.is_stats_logging_rank:
+        if self.is_stats_logging_rank or log_unified_memory_on_all_ranks:
             logger.info(msg)
         if self.current_scheduler_metrics_enabled:
             self.metrics_collector.increment_prefill_cuda_graph_pass(
@@ -856,9 +865,11 @@ class SchedulerMetricsReporter:
         # Periodic work: log + heavy metrics at decode_log_interval
         if self.forward_ct_decode % self.decode_log_interval != 0:
             return
+        log_unified_memory_on_all_ranks = self._log_unified_memory_on_all_ranks()
         if (
             not self.is_stats_logging_rank
             and not self.current_scheduler_metrics_enabled
+            and not log_unified_memory_on_all_ranks
         ):
             return
 
@@ -1001,7 +1012,7 @@ class SchedulerMetricsReporter:
         if ENABLE_METRICS_DEVICE_TIMER and not unified_memory_log_parts:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
-        if self.is_stats_logging_rank:
+        if self.is_stats_logging_rank or log_unified_memory_on_all_ranks:
             logger.info(msg)
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.scheduler.enable_priority_scheduling

@@ -2335,6 +2335,34 @@ def rank0_log(msg: str):
         logger.info(msg)
 
 
+_UNIFIED_MEMORY_LOG_PREFIXES = ("[unified-memory", "[Prefill]", "[Decode]")
+
+
+class _UnifiedMemoryLogRankFilter(logging.Filter):
+    """Limit Unified Memory observability without hiding unrelated rank errors."""
+
+    def __init__(self, *, tp_rank: int, rank_scope: str):
+        super().__init__()
+        if rank_scope not in ("tp0", "all"):
+            raise ValueError(f"Invalid Unified Memory log rank scope: {rank_scope}")
+        self.suppress_unified_memory_logs = rank_scope == "tp0" and tp_rank != 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not self.suppress_unified_memory_logs:
+            return True
+        return not record.getMessage().startswith(_UNIFIED_MEMORY_LOG_PREFIXES)
+
+
+def configure_unified_memory_rank_logging(*, tp_rank: int, rank_scope: str) -> None:
+    """Install the Unified Memory rank policy on configured root handlers."""
+    rank_filter = _UnifiedMemoryLogRankFilter(
+        tp_rank=tp_rank,
+        rank_scope=rank_scope,
+    )
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(rank_filter)
+
+
 def configure_logger(server_args, prefix: str = ""):
     if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
         if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
