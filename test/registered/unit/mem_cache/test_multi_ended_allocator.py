@@ -2138,6 +2138,16 @@ class TestLazyCompaction(unittest.TestCase):
         # live_page_count invariant under compaction.
         self.assertEqual(fa.live_page_count, 4)
 
+    def test_lazy_flush_does_not_log_details_at_info_level(self):
+        _pool, fa, _kv = self._make_full(lazy=True)
+        values = fa.alloc(5)
+        fa.free(values[1:2].clone())
+
+        with self.assertNoLogs(
+            "sglang.srt.mem_cache.multi_ended_allocator", level="INFO"
+        ):
+            self.assertEqual(fa._flush(urgent=True), 1)
+
     def test_lazy_v2p_p2v_identity_after_flush(self):
         """After a flush, v2p ∘ p2v == identity on the live set."""
         _pool, fa, _kv = self._make_full(lazy=True)
@@ -3435,7 +3445,7 @@ class TestDcpWidening(unittest.TestCase):
                 self.assertTrue(bool((written[~owned] == 0).all()))
                 self.assertTrue(bool((written[owned] > 0).all()))
 
-    def _build_composite(self, *, page_size):
+    def _build_composite(self, *, page_size, lazy_compaction=False):
         from sglang.srt.mem_cache.multi_ended_allocator import (
             UnifiedMambaTokenToKVPoolAllocator,
         )
@@ -3465,7 +3475,64 @@ class TestDcpWidening(unittest.TestCase):
             page_size=page_size,
             need_sort=False,
             forward_stream=None,
+            lazy_compaction=lazy_compaction,
         )
+
+    def test_full_mamba_memory_snapshot_exposes_gap_and_capacity_views(self):
+        with self._dcp(1):
+            allocator = self._build_composite(page_size=2, lazy_compaction=True)
+            mamba_ids = allocator.mamba_allocator.alloc(3)
+            self.assertIsNotNone(mamba_ids)
+            gap_before_free = allocator.full_attn_allocator._current_gap_bytes()
+
+            # Lazy free creates a Mamba hole first; the shared gap grows later,
+            # when a FULL allocation urgently flushes the peer.
+            allocator.mamba_allocator.free(mamba_ids[1:2])
+            state = allocator.get_memory_snapshot()
+
+            self.assertEqual(state["shared_gap_bytes"], gap_before_free)
+            self.assertEqual(
+                state["mamba_hole_bytes"],
+                allocator.mamba_allocator.entry_bytes_per_page,
+            )
+            self.assertGreater(
+                state["full_available_schedulable_tokens"],
+                state["full_available_now_tokens"],
+            )
+            self.assertEqual(state["mamba_live_slots"], 2)
+            self.assertEqual(
+                state["full_virtual_free_tokens"],
+                allocator.full_virtual_available_size(),
+            )
+
+            output = allocator.debug_print()
+            self.assertIn(
+                f"unassigned_shared_memory_bytes={gap_before_free}", output
+            )
+            self.assertIn("full_attention_kv_cache={", output)
+            self.assertIn("currently_allocatable_tokens=", output)
+            self.assertIn("allocatable_tokens_after_peer_compaction=", output)
+            self.assertIn("mamba_state_cache={", output)
+            self.assertIn("currently_allocatable_slots=", output)
+            self.assertIn("free_bytes_inside_reserved_region=", output)
+
+    def test_full_shortfall_compacts_peer_without_detail_log(self):
+        with self._dcp(1):
+            allocator = self._build_composite(page_size=2, lazy_compaction=True)
+            mamba_ids = allocator.mamba_allocator.alloc(3)
+            allocator.mamba_allocator.free(mamba_ids[1:2])
+            state = allocator.get_memory_snapshot()
+            need_tokens = (
+                state["full_available_now_tokens"]
+                + allocator.full_attn_allocator.page_size
+            )
+            self.assertLessEqual(
+                need_tokens, state["full_available_schedulable_tokens"]
+            )
+
+            result = allocator.alloc(need_tokens)
+
+            self.assertIsNotNone(result)
 
     def test_mamba_slot_cost_is_in_the_same_units_as_available_size(self):
         """The planner charges `mamba_slot_full_token_cost()` against a budget

@@ -116,7 +116,6 @@ _COMPONENT_POOL_LABEL = {
     ComponentType.MAMBA: PoolName.MAMBA.value,
 }
 
-
 COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
     ComponentType.FULL: FullComponent,
     ComponentType.MAMBA: MambaComponent,
@@ -581,11 +580,6 @@ class UnifiedRadixCache(BasePrefixCache):
             if request_cnt > 0
         }
 
-        logger.info(
-            "[unified-memory-reclaim] allocation-request targets=%s",
-            ", ".join(f"{ct}={size}" for ct, size in available_size_targets.items()),
-        )
-
         # Keep the original behavior first: the component that needs memory
         # evicts its own cache entries before unified memory borrows from a peer.
         result = self._evict(params, available_size_targets)
@@ -593,9 +587,21 @@ class UnifiedRadixCache(BasePrefixCache):
         # Kimi's FULL and MAMBA pools share physical bytes.  If local eviction
         # cannot satisfy the allocation, reclaim unlocked cache entries from the
         # other component and stop as soon as the original target becomes usable.
-        return self._evict_full_mamba_peer_if_needed(
+        result, failure_reason = self._evict_full_mamba_peer_if_needed(
             available_size_targets, result
         )
+        if getattr(
+            self.token_to_kv_pool_allocator,
+            "supports_full_mamba_cross_reclaim",
+            False,
+        ):
+            self._log_full_mamba_reclaim(
+                params,
+                available_size_targets,
+                result,
+                failure_reason,
+            )
+        return result
 
     @staticmethod
     def _evict_request_by_type(params: EvictParams) -> dict[ComponentType, int]:
@@ -622,18 +628,90 @@ class UnifiedRadixCache(BasePrefixCache):
             return self.req_to_token_pool.mamba_allocator.schedulable_available_size()
         raise ValueError(f"Unsupported cache component: {component_type}")
 
+    def _log_full_mamba_reclaim(
+        self,
+        params: EvictParams,
+        available_size_targets: dict[ComponentType, int],
+        result: EvictResult,
+        failure_reason: Optional[str],
+    ) -> None:
+        """Emit one readable record for the complete reclaim attempt."""
+        allocator = self.token_to_kv_pool_allocator
+        allocation_possible = all(
+            self._component_available_size(component_type) >= required
+            for component_type, required in available_size_targets.items()
+        )
+        if allocation_possible:
+            tp_group = getattr(self, "tp_group", None)
+            if (
+                tp_group is not None
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_rank(group=tp_group) != 0
+            ):
+                return
+
+        request_parts = []
+        if params.num_tokens > 0:
+            request_parts.append(f"KV needs {params.num_tokens} tokens")
+        if params.swa_num_tokens > 0:
+            request_parts.append(f"SWA needs {params.swa_num_tokens} tokens")
+        if params.mamba_num > 0:
+            unit = "slot" if params.mamba_num == 1 else "slots"
+            request_parts.append(f"Mamba needs {params.mamba_num} {unit}")
+        if not request_parts:
+            return
+
+        evicted_parts = []
+        if result.num_tokens_evicted > 0:
+            evicted_parts.append(f"{result.num_tokens_evicted} KV tokens")
+        if result.swa_num_tokens_evicted > 0:
+            evicted_parts.append(f"{result.swa_num_tokens_evicted} SWA tokens")
+        if result.mamba_num_evicted > 0:
+            unit = "slot" if result.mamba_num_evicted == 1 else "slots"
+            evicted_parts.append(f"{result.mamba_num_evicted} Mamba {unit}")
+        action = (
+            f"evicted {' and '.join(evicted_parts)}"
+            if evicted_parts
+            else "evicted nothing"
+        )
+
+        state = allocator.get_memory_snapshot()
+        mamba_free = state["mamba_available_schedulable_slots"]
+        mamba_free_unit = "slot" if mamba_free == 1 else "slots"
+        message = (
+            f"[unified-memory-reclaim] {' and '.join(request_parts)} | {action} | "
+            "after reclaim: "
+            f"KV free={state['full_available_schedulable_tokens']} tokens, "
+            f"Mamba free={mamba_free} {mamba_free_unit}, "
+            f"shared gap={state['shared_gap_bytes'] / (1 << 20):.1f} MiB | "
+            f"allocation possible={'yes' if allocation_possible else 'no'}"
+        )
+        if not allocation_possible:
+            if failure_reason is None:
+                failure_reason = (
+                    "reclaimed memory is not allocatable"
+                    if evicted_parts
+                    else "no unlocked cache available"
+                )
+            message += f" | reason={failure_reason}"
+            logger.warning(message)
+        else:
+            logger.info(message)
+
     def _evict_full_mamba_peer_if_needed(
         self,
         available_size_targets: dict[ComponentType, int],
         result: EvictResult,
-    ) -> EvictResult:
+    ) -> tuple[EvictResult, Optional[str]]:
         """Use the peer's unlocked cache when Kimi's local eviction is short."""
         allocator = self.token_to_kv_pool_allocator
         if (
             getattr(allocator, "supports_full_mamba_cross_reclaim", False)
             is not True
         ):
-            return result
+            return result, None
+
+        failure_reason = None
 
         # The ID-space check prevents a useless peer eviction: shared bytes can
         # move between pools, but FULL token IDs and MAMBA slot IDs cannot.
@@ -661,39 +739,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
             virtual_available = virtual_available_size()
             if virtual_available < required:
-                logger.warning(
-                    "[unified-memory-reclaim] cross-skip target=%s victim=%s "
-                    "reason=virtual-id-shortage available=%d required=%d "
-                    "virtual_available=%d",
-                    target,
-                    victim,
-                    before,
-                    required,
-                    virtual_available,
-                )
+                failure_reason = "not enough unused virtual IDs"
                 continue
 
             victim_evictable = self.tree_core.component_evictable_size(victim)
             if victim_evictable <= 0:
-                logger.warning(
-                    "[unified-memory-reclaim] cross-skip target=%s victim=%s "
-                    "reason=no-evictable-cache available=%d required=%d",
-                    target,
-                    victim,
-                    before,
-                    required,
-                )
+                failure_reason = "no unlocked cache available"
                 continue
 
-            logger.info(
-                "[unified-memory-reclaim] cross-start target=%s victim=%s "
-                "available=%d required=%d victim_evictable=%d",
-                target,
-                victim,
-                before,
-                required,
-                victim_evictable,
-            )
             cross_params = EvictParams(
                 num_tokens=(
                     victim_evictable if victim == ComponentType.FULL else 0
@@ -711,22 +764,10 @@ class UnifiedRadixCache(BasePrefixCache):
             result.swa_num_tokens_evicted += cross_result.swa_num_tokens_evicted
             result.mamba_num_evicted += cross_result.mamba_num_evicted
 
-            after = self._component_available_size(target)
-            logger.info(
-                "[unified-memory-reclaim] cross-done target=%s victim=%s "
-                "available=%d->%d required=%d evicted_full=%d "
-                "evicted_mamba=%d satisfied=%s",
-                target,
-                victim,
-                before,
-                after,
-                required,
-                cross_result.num_tokens_evicted,
-                cross_result.mamba_num_evicted,
-                after >= required,
-            )
+            if self._component_available_size(target) < required:
+                failure_reason = "reclaimed memory is not allocatable"
 
-        return result
+        return result, failure_reason
 
     def _evict(
         self,
@@ -839,6 +880,11 @@ class UnifiedRadixCache(BasePrefixCache):
         def target_reached(component_type: ComponentType) -> bool:
             if available_size_targets is None:
                 return False
+            # Allocation recovery may run inside the scheduler's free group.
+            # Materialize both earlier releases and this eviction step before
+            # checking shared capacity; otherwise the radix tracker can report
+            # progress while the allocator still sees no reusable pages.
+            self.token_to_kv_pool_allocator.drain_free_group()
             target_component = capacity_target(component_type)
             target = available_size_targets.get(target_component)
             # Do not compact on every eviction step. Shared allocators include
@@ -854,16 +900,6 @@ class UnifiedRadixCache(BasePrefixCache):
             # on a shared pool, released enough bytes to satisfy its allocation.
             if tracker[ct] >= request_cnt or target_reached(ct):
                 continue
-            target_component = capacity_target(ct)
-            target_required = (
-                available_size_targets.get(target_component)
-                if available_size_targets is not None
-                else None
-            )
-            target_available_before = self._component_available_size(
-                target_component
-            )
-            tracker_before = dict(tracker)
             self.tree_core.evict_device_start(ct, request_cnt)
             try:
                 while not target_reached(ct):
@@ -901,26 +937,6 @@ class UnifiedRadixCache(BasePrefixCache):
                             )
             finally:
                 self.tree_core.evict_device_end(ct)
-
-            # One concise action record covers local, explicit, and cross-pool
-            # eviction without logging every radix node in a large prefix.
-            logger.info(
-                "[unified-memory-reclaim] evict-action victim=%s target=%s "
-                "requested=%d available=%d->%d required=%s freed_full=%d "
-                "freed_swa=%d freed_mamba=%d",
-                ct,
-                target_component,
-                request_cnt,
-                target_available_before,
-                self._component_available_size(target_component),
-                target_required,
-                tracker.get(ComponentType.FULL, 0)
-                - tracker_before.get(ComponentType.FULL, 0),
-                tracker.get(ComponentType.SWA, 0)
-                - tracker_before.get(ComponentType.SWA, 0),
-                tracker.get(ComponentType.MAMBA, 0)
-                - tracker_before.get(ComponentType.MAMBA, 0),
-            )
 
     def _record_dropped_tokens(
         self,

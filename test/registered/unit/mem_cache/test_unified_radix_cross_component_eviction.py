@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import torch
+
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.multi_ended_allocator import (
@@ -28,6 +30,7 @@ class TestUnifiedRadixCrossComponentEviction(CustomTestCase):
         full_evictable: int = 0,
         mamba_evictable: int = 0,
         full_tokens_per_mamba: int = 64,
+        defer_full_eviction: bool = False,
     ):
         cache = object.__new__(UnifiedRadixCache)
         cache.disable = False
@@ -40,6 +43,10 @@ class TestUnifiedRadixCrossComponentEviction(CustomTestCase):
             ComponentType.FULL: full_available,
             ComponentType.MAMBA: mamba_available,
         }
+        deferred_capacity = {
+            ComponentType.FULL: 0,
+            ComponentType.MAMBA: 0,
+        }
         evictable = {
             ComponentType.FULL: full_evictable,
             ComponentType.MAMBA: mamba_evictable,
@@ -50,6 +57,19 @@ class TestUnifiedRadixCrossComponentEviction(CustomTestCase):
         allocator.available_size.side_effect = lambda: capacity[ComponentType.FULL]
         allocator.full_virtual_available_size.return_value = full_virtual_available
         allocator.mamba_virtual_available_size.return_value = mamba_virtual_available
+        allocator.get_memory_snapshot.side_effect = lambda: {
+            "full_available_schedulable_tokens": capacity[ComponentType.FULL],
+            "mamba_available_schedulable_slots": capacity[ComponentType.MAMBA],
+            "shared_gap_bytes": capacity[ComponentType.FULL] * 4,
+        }
+        if defer_full_eviction:
+
+            def drain_group():
+                for component_type in deferred_capacity:
+                    capacity[component_type] += deferred_capacity[component_type]
+                    deferred_capacity[component_type] = 0
+
+            allocator.drain_free_group.side_effect = drain_group
         cache.token_to_kv_pool_allocator = allocator
 
         mamba_allocator = MagicMock()
@@ -75,8 +95,9 @@ class TestUnifiedRadixCrossComponentEviction(CustomTestCase):
             victim = active_victim["component"]
             if victim == ComponentType.FULL:
                 tracker[ComponentType.FULL] += 32
-                capacity[ComponentType.FULL] += 32
-                capacity[ComponentType.MAMBA] += 1
+                target = deferred_capacity if defer_full_eviction else capacity
+                target[ComponentType.FULL] += 32
+                target[ComponentType.MAMBA] += 1
             else:
                 tracker[ComponentType.MAMBA] += 1
                 capacity[ComponentType.FULL] += full_tokens_per_mamba
@@ -103,9 +124,15 @@ class TestUnifiedRadixCrossComponentEviction(CustomTestCase):
             [call(ComponentType.FULL, 64), call(ComponentType.MAMBA, 3)],
         )
         output = "\n".join(logs.output)
-        self.assertIn("cross-start target=full victim=mamba", output)
-        self.assertIn("evict-action victim=mamba target=full", output)
-        self.assertIn("cross-done target=full victim=mamba", output)
+        self.assertEqual(output.count("[unified-memory-reclaim]"), 1)
+        self.assertIn("KV needs 64 tokens", output)
+        self.assertIn("evicted 1 Mamba slot", output)
+        self.assertIn(
+            "after reclaim: KV free=64 tokens, Mamba free=1 slot, "
+            "shared gap=0.0 MiB",
+            output,
+        )
+        self.assertIn("allocation possible=yes", output)
 
     def test_kimi_prefill_regression_reclaims_mamba_for_full_shortfall(self):
         cache, capacity = self._build_cache(
@@ -133,6 +160,39 @@ class TestUnifiedRadixCrossComponentEviction(CustomTestCase):
             [call(ComponentType.MAMBA, 1), call(ComponentType.FULL, 64)],
         )
 
+    def test_grouped_full_free_is_visible_before_mamba_eviction(self):
+        """Regression for allocation recovery inside prefill's free group."""
+        cache, capacity = self._build_cache(full_evictable=64)
+
+        def drain_group():
+            # A previously released FULL page becomes shared capacity for one
+            # Mamba slot only when the surrounding free group is drained.
+            capacity[ComponentType.FULL] += 32
+            capacity[ComponentType.MAMBA] += 1
+            cache.token_to_kv_pool_allocator.drain_free_group.side_effect = None
+
+        cache.token_to_kv_pool_allocator.drain_free_group.side_effect = drain_group
+
+        result = cache.evict_for_alloc(EvictParams(mamba_num=1))
+
+        self.assertEqual(result.num_tokens_evicted, 0)
+        self.assertEqual(result.mamba_num_evicted, 0)
+        self.assertEqual(capacity[ComponentType.MAMBA], 1)
+        cache.tree_core.evict_device_start.assert_not_called()
+        cache.token_to_kv_pool_allocator.drain_free_group.assert_called()
+
+    def test_cross_evicted_full_free_is_visible_to_mamba_retry(self):
+        cache, capacity = self._build_cache(
+            full_evictable=64,
+            defer_full_eviction=True,
+        )
+
+        result = cache.evict_for_alloc(EvictParams(mamba_num=1))
+
+        self.assertEqual(result.num_tokens_evicted, 32)
+        self.assertEqual(capacity[ComponentType.MAMBA], 1)
+        self.assertEqual(cache._evict_device_leaf.call_count, 1)
+
     def test_virtual_id_shortage_does_not_evict_peer(self):
         cache, _ = self._build_cache(
             mamba_virtual_available=0,
@@ -148,7 +208,7 @@ class TestUnifiedRadixCrossComponentEviction(CustomTestCase):
         cache.tree_core.evict_device_start.assert_called_once_with(
             ComponentType.MAMBA, 1
         )
-        self.assertIn("reason=virtual-id-shortage", "\n".join(logs.output))
+        self.assertIn("reason=not enough unused virtual IDs", "\n".join(logs.output))
 
     def test_no_peer_victim_exits_without_looping(self):
         cache, _ = self._build_cache()
@@ -163,7 +223,7 @@ class TestUnifiedRadixCrossComponentEviction(CustomTestCase):
         cache.tree_core.evict_device_start.assert_called_once_with(
             ComponentType.FULL, 64
         )
-        self.assertIn("reason=no-evictable-cache", "\n".join(logs.output))
+        self.assertIn("reason=no unlocked cache available", "\n".join(logs.output))
 
     def test_virtual_capacity_uses_allocator_units(self):
         allocator = object.__new__(UnifiedMambaTokenToKVPoolAllocator)
@@ -176,6 +236,28 @@ class TestUnifiedRadixCrossComponentEviction(CustomTestCase):
 
         self.assertEqual(allocator.full_virtual_available_size(), 24)
         self.assertEqual(allocator.mamba_virtual_available_size(), 4)
+
+    def test_drain_free_group_keeps_outer_group_open(self):
+        allocator = object.__new__(UnifiedMambaTokenToKVPoolAllocator)
+        allocator.free_group = None
+        allocator.free_page_reps_group = None
+        allocator.full_attn_allocator = MagicMock()
+        allocator.mamba_allocator = MagicMock()
+
+        allocator.free_group_begin()
+        allocator.free(torch.tensor([7], dtype=torch.int64))
+        allocator.drain_free_group()
+
+        allocator.full_attn_allocator.free.assert_called_once()
+        self.assertEqual(allocator.free_group, [])
+        self.assertEqual(allocator.free_page_reps_group, [])
+
+        allocator.free(torch.tensor([8], dtype=torch.int64))
+        allocator.full_attn_allocator.free.assert_called_once()
+        allocator.free_group_end()
+        self.assertEqual(allocator.full_attn_allocator.free.call_count, 2)
+        self.assertIsNone(allocator.free_group)
+        self.assertIsNone(allocator.free_page_reps_group)
 
 
 class TestUnifiedFullMambaAdmission(CustomTestCase):

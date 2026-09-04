@@ -124,6 +124,102 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     )
 
 
+class TestUnifiedMemoryBatchLogging(unittest.TestCase):
+    def test_full_mamba_allocator_state_is_added_to_batch_log_parts(self):
+        memory_snapshot = {
+            "full_span_bytes": 7_562_723_328,
+            "mamba_span_bytes": 5_729_495_040,
+            "shared_gap_bytes": 96_058_368,
+        }
+        scheduler = types.SimpleNamespace(
+            token_to_kv_pool_allocator=types.SimpleNamespace(
+                supports_full_mamba_cross_reclaim=True,
+                get_memory_snapshot=lambda: memory_snapshot,
+            )
+        )
+        reporter = _make_reporter(self, scheduler)
+        pool_stats = types.SimpleNamespace(
+            full_token_usage=0.93,
+            mamba_usage=0.25,
+            full_evictable_size=512,
+            mamba_evictable_size=3,
+        )
+
+        self.assertEqual(
+            reporter._unified_memory_log_parts(pool_stats),
+            [
+                "unified memory: KV cache=56.5%, Mamba pool=42.8%, "
+                "shared gap=0.7% (91.6 MiB)",
+                "evictable: KV=512 tokens, Mamba=3 slots",
+            ],
+        )
+
+    def test_prefill_log_contains_unified_memory_snapshot(self):
+        pool_stats = types.SimpleNamespace(
+            full_token_usage=0.93,
+            mamba_usage=0.25,
+            full_evictable_size=512,
+            mamba_evictable_size=3,
+            get_prefill_usage_msg_parts=lambda: [
+                "full token usage: 0.93",
+                "mamba usage: 0.25",
+            ],
+        )
+        scheduler = types.SimpleNamespace(
+            token_to_kv_pool_allocator=types.SimpleNamespace(
+                supports_full_mamba_cross_reclaim=True,
+                get_memory_snapshot=lambda: {
+                    "full_span_bytes": 7_562_723_328,
+                    "mamba_span_bytes": 5_729_495_040,
+                    "shared_gap_bytes": 96_058_368,
+                },
+            ),
+            pool_stats_observer=types.SimpleNamespace(
+                get_pool_stats=lambda: pool_stats
+            ),
+            waiting_queue=[],
+            disaggregation_mode=DisaggregationMode.NULL,
+            forward_ct=1,
+            kv_events_publisher=types.SimpleNamespace(
+                init_kv_events=lambda *args, **kwargs: None,
+                publish_kv_events=lambda: None,
+            ),
+        )
+        reporter = _make_reporter(self, scheduler)
+        stats = PrefillStats(
+            log_input_tokens=512,
+            log_hit_tokens=19_712,
+            new_token_ratio=0.5,
+            num_running_reqs=types.SimpleNamespace(total=14),
+            num_new_seqs=1,
+            num_pending_tokens=20_751,
+        )
+
+        with self.assertLogs(
+            "sglang.srt.managers.scheduler_components.metrics_reporter", level="INFO"
+        ) as logs:
+            reporter.report_prefill_stats(None, stats, can_run_cuda_graph=False)
+
+        output = "\n".join(logs.output)
+        self.assertIn(
+            "[Prefill] requests: new=1, running=14, waiting=0", output
+        )
+        self.assertIn("tokens: computed=512, reused=19712, pending=20751", output)
+        self.assertIn(
+            "unified memory: KV cache=56.5%, Mamba pool=42.8%, "
+            "shared gap=0.7% (91.6 MiB)",
+            output,
+        )
+        self.assertIn("evictable: KV=512 tokens, Mamba=3 slots", output)
+        self.assertIn("input throughput=", output)
+        self.assertIn("tokens/s", output)
+        self.assertNotIn("#new-seq", output)
+        self.assertNotIn("full token usage", output)
+        self.assertNotIn("mamba usage", output)
+        self.assertNotIn("cuda graph", output)
+        self.assertNotIn("now/sched/virtual", output)
+
+
 class TestForwardPassMetrics(unittest.TestCase):
     def setUp(self):
         self.scheduler = types.SimpleNamespace()

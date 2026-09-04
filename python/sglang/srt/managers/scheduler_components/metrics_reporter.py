@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.schedule_policy import PrefillAdder
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
     from sglang.srt.managers.utils import EmbeddingBatchResult
 
 
@@ -568,6 +569,36 @@ class SchedulerMetricsReporter:
         a subclass may override it."""
         return ""
 
+    def _unified_memory_log_parts(self, pool_stats: PoolStats) -> List[str]:
+        """Concise physical-memory view for Kimi FULL/Mamba batch logs."""
+        allocator = self.scheduler.token_to_kv_pool_allocator
+        if not getattr(allocator, "supports_full_mamba_cross_reclaim", False):
+            return []
+
+        state = allocator.get_memory_snapshot()
+        usable_bytes = (
+            state["full_span_bytes"]
+            + state["mamba_span_bytes"]
+            + state["shared_gap_bytes"]
+        )
+        if usable_bytes > 0:
+            full_percent = state["full_span_bytes"] / usable_bytes * 100
+            mamba_percent = state["mamba_span_bytes"] / usable_bytes * 100
+            gap_percent = state["shared_gap_bytes"] / usable_bytes * 100
+        else:
+            full_percent = mamba_percent = gap_percent = 0.0
+
+        mib = 1 << 20
+        return [
+            "unified memory: "
+            f"KV cache={full_percent:.1f}%, "
+            f"Mamba pool={mamba_percent:.1f}%, "
+            f"shared gap={gap_percent:.1f}% "
+            f"({state['shared_gap_bytes'] / mib:.1f} MiB)",
+            f"evictable: KV={pool_stats.full_evictable_size} tokens, "
+            f"Mamba={pool_stats.mamba_evictable_size or 0} slots",
+        ]
+
     def reset_metrics(self):
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
@@ -599,7 +630,12 @@ class SchedulerMetricsReporter:
         )
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
-        token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
+        unified_memory_log_parts = self._unified_memory_log_parts(pool_stats)
+        token_usage_msg = (
+            " | ".join(unified_memory_log_parts)
+            if unified_memory_log_parts
+            else ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
+        )
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
         batch_iter = (
@@ -609,37 +645,69 @@ class SchedulerMetricsReporter:
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
-        msg = (
-            f"Prefill batch{iter_msg}, "
-            f"#new-seq: {prefill_stats.num_new_seqs}, "
-            f"#new-token: {prefill_stats.log_input_tokens}, "
-            f"#cached-token: {prefill_stats.log_hit_tokens}, "
-            f"{token_usage_msg}"
-            f"#running-req: {prefill_stats.num_running_reqs.total}, "
-            f"#queue-req: {len(self.scheduler.waiting_queue)}, "
-            f"#pending-token: {prefill_stats.num_pending_tokens}, "
-        )
+        if unified_memory_log_parts:
+            msg = (
+                f"[Prefill]{iter_msg} requests: "
+                f"new={prefill_stats.num_new_seqs}, "
+                f"running={prefill_stats.num_running_reqs.total}, "
+                f"waiting={len(self.scheduler.waiting_queue)} | "
+                f"tokens: computed={prefill_stats.log_input_tokens}, "
+                f"reused={prefill_stats.log_hit_tokens}, "
+                f"pending={prefill_stats.num_pending_tokens} | "
+                f"{token_usage_msg}"
+            )
+        else:
+            msg = (
+                f"Prefill batch{iter_msg}, "
+                f"#new-seq: {prefill_stats.num_new_seqs}, "
+                f"#new-token: {prefill_stats.log_input_tokens}, "
+                f"#cached-token: {prefill_stats.log_hit_tokens}, "
+                f"{token_usage_msg}"
+                f"#running-req: {prefill_stats.num_running_reqs.total}, "
+                f"#queue-req: {len(self.scheduler.waiting_queue)}, "
+                f"#pending-token: {prefill_stats.num_pending_tokens}, "
+            )
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-            msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
-            msg += (
-                f"#inflight-req: {len(self.scheduler.disagg_prefill_inflight_queue)}, "
-            )
             num_optimistic = sum(1 for r in batch.reqs if r.pending_bootstrap)
-            msg += f"#optimistic-req: {num_optimistic}, "
+            if unified_memory_log_parts:
+                msg += (
+                    " | disaggregation requests: "
+                    f"bootstrap={len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
+                    f"inflight={len(self.scheduler.disagg_prefill_inflight_queue)}, "
+                    f"optimistic={num_optimistic}"
+                )
+            else:
+                msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
+                msg += (
+                    f"#inflight-req: {len(self.scheduler.disagg_prefill_inflight_queue)}, "
+                )
+                msg += f"#optimistic-req: {num_optimistic}, "
 
         if (
             get_disagg().language_only
             and get_disagg().encoder_transfer_backend == "zmq_to_scheduler"
         ):
+            waiting_image_request_count = len(self.scheduler.mm_receiver.waiting_list)
+            if unified_memory_log_parts:
+                msg += f" | waiting image requests={waiting_image_request_count}"
+            else:
+                msg += f"waiting-image-req: {waiting_image_request_count}, "
+
+        if unified_memory_log_parts:
             msg += (
-                f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
+                " | input throughput="
+                f"{self.last_input_throughput:.2f} tokens/s"
             )
+        else:
+            msg += f"{self._graph_backend_label}: {can_run_cuda_graph}, "
+            msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
-        msg += f"{self._graph_backend_label}: {can_run_cuda_graph}, "
-        msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
-
-        if self.enable_mfu_metrics and gap_latency > 0:
+        if (
+            self.enable_mfu_metrics
+            and gap_latency > 0
+            and not unified_memory_log_parts
+        ):
             # Prefer the SoL suffix when it carries content: it scores FLOPs against
             # each forward's actual GPU span (device timer). The wall-clock est.
             # TFLOPS below divides FLOPs by gap_latency -- the inter-log interval on
@@ -653,7 +721,7 @@ class SchedulerMetricsReporter:
                 tflops_per_s = flops / gap_latency / 1e12
                 msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
 
-        if ENABLE_METRICS_DEVICE_TIMER:
+        if ENABLE_METRICS_DEVICE_TIMER and not unified_memory_log_parts:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
         if self.is_stats_logging_rank:
@@ -802,7 +870,12 @@ class SchedulerMetricsReporter:
         num_running_reqs = len(batch.reqs)
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
-        token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
+        unified_memory_log_parts = self._unified_memory_log_parts(pool_stats)
+        token_usage_msg = (
+            " | ".join(unified_memory_log_parts)
+            if unified_memory_log_parts
+            else ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
+        )
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(
@@ -815,7 +888,13 @@ class SchedulerMetricsReporter:
             else self.scheduler.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        if unified_memory_log_parts:
+            msg = (
+                f"[Decode]{iter_msg} requests: running={num_running_reqs}, "
+                f"waiting={len(self.scheduler.waiting_queue)} | {token_usage_msg}"
+            )
+        else:
+            msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0
@@ -889,11 +968,14 @@ class SchedulerMetricsReporter:
                 f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
             )
 
-        msg += (
-            f"{self._graph_backend_label}: {can_run_cuda_graph}, "
-            f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-            f"#queue-req: {len(self.scheduler.waiting_queue)}"
-        )
+        if unified_memory_log_parts:
+            msg += f" | output throughput={self.last_gen_throughput:.2f} tokens/s"
+        else:
+            msg += (
+                f"{self._graph_backend_label}: {can_run_cuda_graph}, "
+                f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
+                f"#queue-req: {len(self.scheduler.waiting_queue)}"
+            )
 
         if self.enable_mfu_metrics and gap_latency > 0:
             flops_per_s = self._mfu_log_flops / gap_latency
@@ -902,20 +984,21 @@ class SchedulerMetricsReporter:
             tflops_per_s = flops_per_s / 1e12
             read_gb_per_s = read_bytes_per_s / 1e9
             write_gb_per_s = write_bytes_per_s / 1e9
-            msg += (
-                f", est. decode TFLOPS/s (per GPU): {tflops_per_s:.2f}, "
-                f"est. read BW (GB/s per GPU): {read_gb_per_s:.2f}, "
-                f"est. write BW (GB/s per GPU): {write_gb_per_s:.2f}"
-            )
-            msg += self._decode_sol_suffix(
-                batch,
-                gap_latency / max(1, self.decode_log_interval),
-            )
+            if not unified_memory_log_parts:
+                msg += (
+                    f", est. decode TFLOPS/s (per GPU): {tflops_per_s:.2f}, "
+                    f"est. read BW (GB/s per GPU): {read_gb_per_s:.2f}, "
+                    f"est. write BW (GB/s per GPU): {write_gb_per_s:.2f}"
+                )
+                msg += self._decode_sol_suffix(
+                    batch,
+                    gap_latency / max(1, self.decode_log_interval),
+                )
             self._mfu_log_flops = 0.0
             self._mfu_log_read_bytes = 0.0
             self._mfu_log_write_bytes = 0.0
 
-        if ENABLE_METRICS_DEVICE_TIMER:
+        if ENABLE_METRICS_DEVICE_TIMER and not unified_memory_log_parts:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
         if self.is_stats_logging_rank:

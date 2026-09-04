@@ -102,6 +102,20 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if pending:
             self.free(torch.cat(pending))
 
+    def drain_free_group(self) -> None:
+        """Make grouped frees visible without ending the caller's group.
+
+        Allocation recovery can run inside a scheduler free group.  In that
+        case an eviction has logically removed cache entries, but their pages
+        remain buffered until ``free_group_end()`` and cannot satisfy the
+        allocation being recovered.  Drain the current group as a correctness
+        barrier, then reopen it for the surrounding scheduler scope.
+        """
+        if self.free_group is None:
+            return
+        self.free_group_end()
+        self.free_group_begin()
+
     @staticmethod
     def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
         """Take ownership before a caller can mutate a deferred tensor view."""

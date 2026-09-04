@@ -67,6 +67,8 @@ _LAZY_COMPACTION_STATS_ENABLED = envs.SGLANG_LOG_LAZY_COMPACTION_STATS.get()
 _LAZY_COMPACTION_STATS_INTERVAL_SEC = float(
     envs.SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC.get()
 )
+# Temporarily disabled while unified-memory correctness is being validated.
+_LOG_UNIFIED_MEMORY_FLUSH_DETAILS = False
 # Signal handler emits each instance's final counters (atexit misses signal exits).
 _STATS_INSTANCES: weakref.WeakSet[MultiEndedAllocator] = weakref.WeakSet()
 _SIGNAL_HANDLERS_INSTALLED = False
@@ -236,8 +238,8 @@ def _relieve_for_alloc(short_pool, need_tokens: int) -> bool:
     free time) and a FLOAT always has boundary absorption to do — so the
     ladder itself never branches on lazy mode, member kind, or layout.
     """
-    for m in short_pool._flush_targets():
-        m._flush(urgent=True)
+    for peer in short_pool._flush_targets():
+        peer._flush(urgent=True)
     if need_tokens <= short_pool.available_size():
         return True
     short_pool._ask_float_for_room(need_tokens)
@@ -1874,20 +1876,51 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if self.disagg_move_gate is not None and not self.disagg_move_gate():
             # Holes stay in the free list; the next flush picks them up.
             return 0
+        # Measure the scheduler-visible cost without synchronizing CUDA just for
+        # logging.  GPU copies are asynchronous, so this is deliberately named
+        # `host_elapsed_ms`; `MultiEndedAlloc._flush` remains available to the
+        # profiler when exact device-side timing is needed.
+        flush_started_at = _time_mod.perf_counter()
+        phase_started_at = flush_started_at
+        watermark_before = self.watermark_physical
+        hole_pages_before = int(self._free_phys_pages.numel())
+        pending_pages_before = len(self._pending_reuse_pages_cpu)
+        available_before = self.available_size()
+        gap_bytes_before = self._current_gap_bytes()
         self._stats_n_flush_calls += 1
+        snapshot_ms = (_time_mod.perf_counter() - phase_started_at) * 1000.0
         with record_function("MultiEndedAlloc._flush"):
+            phase_started_at = _time_mod.perf_counter()
             self._drain_pending_reuse(urgent=urgent)
+            drain_ms = (_time_mod.perf_counter() - phase_started_at) * 1000.0
 
             # Sort ASCENDING.
+            phase_started_at = _time_mod.perf_counter()
             if self._free_phys_pages.numel() > 1:
                 self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
+            sort_enqueue_ms = (
+                _time_mod.perf_counter() - phase_started_at
+            ) * 1000.0
 
+            # `torch.sort` and the earlier CUDA work are asynchronous.  This
+            # `.tolist()` is the first forced D2H synchronization, so its timing
+            # deliberately includes any queued work that it has to wait for.
+            phase_started_at = _time_mod.perf_counter()
             all_cpu = self._free_phys_pages.tolist()  # one batched D2H sync
+            free_list_sync_ms = (
+                _time_mod.perf_counter() - phase_started_at
+            ) * 1000.0
 
             # `holes_cpu` = interior holes; `_free_phys_pages == holes_cpu` after.
+            phase_started_at = _time_mod.perf_counter()
             new_wm, holes_cpu = self._absorb_boundary_holes(all_cpu)
+            absorb_ms = (_time_mod.perf_counter() - phase_started_at) * 1000.0
 
             latest_event = self._latest_forward_done_event
+            forward_wait_enqueue_ms = 0.0
+            forward_waits = 0
+            write_set_sync_ms = 0.0
+            move_remap_enqueue_ms = 0.0
 
             # Single-pass FULL-PACK (urgent only): the crossing-checked walk packs
             # all live below the frontier so the exit can retreat past every
@@ -1897,7 +1930,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # and the walk runs race-free (empty write_set, no `_pending_reuse`).
             single_pass_absorb = urgent and len(holes_cpu) > 0
             if single_pass_absorb:
+                wait_started_at = _time_mod.perf_counter()
+                if latest_event is not None:
+                    forward_waits += 1
                 self._settle_inflight_forward()
+                forward_wait_enqueue_ms += (
+                    _time_mod.perf_counter() - wait_started_at
+                ) * 1000.0
                 latest_event = None  # reads/writes settled → srcs are fired
 
             # write_set: None = not yet materialized (do it inline on the first
@@ -1932,6 +1971,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             move_cap = self._lazy_max_moves_per_call if not urgent else None
 
             n_moves = 0
+            compact_started_at = _time_mod.perf_counter()
+            compact_nested_ms = 0.0
             while n_dst_consumed < len(holes_cpu):
                 src, j_cursor = self._topmost_survivor(
                     start_hint=cursor,
@@ -1943,21 +1984,40 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
                 # Case A: write race.
                 if write_set is None:
+                    nested_started_at = _time_mod.perf_counter()
                     materialized = self._materialize_inflight_write_set()
+                    nested_elapsed_ms = (
+                        _time_mod.perf_counter() - nested_started_at
+                    ) * 1000.0
+                    write_set_sync_ms += nested_elapsed_ms
+                    compact_nested_ms += nested_elapsed_ms
                     write_set = materialized if materialized is not None else set()
                 if write_set and src in write_set:
                     if urgent:
                         # Commit accumulated moves, then wait the forward so the
                         # rest of the walk is race-free.
+                        nested_started_at = _time_mod.perf_counter()
                         self._commit_move_batch(
                             srcs, dsts, latest_event, released_fired
                         )
+                        nested_elapsed_ms = (
+                            _time_mod.perf_counter() - nested_started_at
+                        ) * 1000.0
+                        move_remap_enqueue_ms += nested_elapsed_ms
+                        compact_nested_ms += nested_elapsed_ms
                         n_moves += len(srcs)
                         srcs.clear()
                         dsts.clear()
                         inflight = self._inflight_forward
                         if inflight is not None:
+                            nested_started_at = _time_mod.perf_counter()
+                            forward_waits += 1
                             torch.cuda.current_stream().wait_event(inflight[0])
+                            nested_elapsed_ms = (
+                                _time_mod.perf_counter() - nested_started_at
+                            ) * 1000.0
+                            forward_wait_enqueue_ms += nested_elapsed_ms
+                            compact_nested_ms += nested_elapsed_ms
                             self._inflight_forward = None
                         write_set = set()  # forward drained → no race
                         latest_event = None
@@ -1997,9 +2057,19 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 if move_cap is not None and len(srcs) >= move_cap:
                     break
 
+            compact_wall_ms = (
+                _time_mod.perf_counter() - compact_started_at
+            ) * 1000.0
+            plan_ms = max(0.0, compact_wall_ms - compact_nested_ms)
+
+            phase_started_at = _time_mod.perf_counter()
             self._commit_move_batch(srcs, dsts, latest_event, released_fired)
+            move_remap_enqueue_ms += (
+                _time_mod.perf_counter() - phase_started_at
+            ) * 1000.0
             n_moves += len(srcs)
 
+            phase_started_at = _time_mod.perf_counter()
             if single_pass_absorb:
                 # FULL-PACK reclaim (urgent): all interior holes now sit above the
                 # frontier, so retreat past the whole lot and EMPTY the free list —
@@ -2032,6 +2102,84 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self._stats_n_flush_did_work += 1
                 self._stats_n_flush_moves += n_moves
             self._maybe_emit_stats()
+
+            watermark_after = self.watermark_physical
+            reclaimed_pages = abs(watermark_after - watermark_before)
+            hole_pages_after = int(self._free_phys_pages.numel())
+            pending_pages_after = len(self._pending_reuse_pages_cpu)
+            available_after = self.available_size()
+            gap_bytes_after = self._current_gap_bytes()
+            reclaim_accounting_ms = (
+                _time_mod.perf_counter() - phase_started_at
+            ) * 1000.0
+            host_elapsed_ms = (
+                _time_mod.perf_counter() - flush_started_at
+            ) * 1000.0
+            accounted_ms = (
+                snapshot_ms
+                + drain_ms
+                + sort_enqueue_ms
+                + free_list_sync_ms
+                + absorb_ms
+                + forward_wait_enqueue_ms
+                + write_set_sync_ms
+                + plan_ms
+                + move_remap_enqueue_ms
+                + reclaim_accounting_ms
+            )
+            other_ms = max(0.0, host_elapsed_ms - accounted_ms)
+            if (
+                _LOG_UNIFIED_MEMORY_FLUSH_DETAILS
+                and (
+                    urgent
+                    or n_moves > 0
+                    or reclaimed_pages > 0
+                    or hole_pages_after != hole_pages_before
+                    or pending_pages_after != pending_pages_before
+                )
+            ):
+                logger.info(
+                    "[unified-memory-flush] pool=%s urgent=%s "
+                    "host_elapsed_ms=%.3f moved_pages=%d "
+                    "move_payload_bytes=%d reclaimed_pages=%d "
+                    "reclaimed_bytes=%d watermark_page=%d->%d "
+                    "hole_pages=%d->%d pending_pages=%d->%d "
+                    "available_units=%d->%d shared_gap_bytes=%d->%d "
+                    "phase_ms={snapshot=%.3f,drain=%.3f,sort_enqueue=%.3f,"
+                    "free_list_sync=%.3f,absorb=%.3f,"
+                    "forward_wait_enqueue=%.3f,write_set_sync=%.3f,"
+                    "plan=%.3f,move_remap_enqueue=%.3f,"
+                    "reclaim_accounting=%.3f,other=%.3f} forward_waits=%d",
+                    self.sub_pool_name,
+                    urgent,
+                    host_elapsed_ms,
+                    n_moves,
+                    n_moves * self.entry_bytes_per_page,
+                    reclaimed_pages,
+                    reclaimed_pages * self.entry_bytes_per_page,
+                    watermark_before,
+                    watermark_after,
+                    hole_pages_before,
+                    hole_pages_after,
+                    pending_pages_before,
+                    pending_pages_after,
+                    available_before,
+                    available_after,
+                    gap_bytes_before,
+                    gap_bytes_after,
+                    snapshot_ms,
+                    drain_ms,
+                    sort_enqueue_ms,
+                    free_list_sync_ms,
+                    absorb_ms,
+                    forward_wait_enqueue_ms,
+                    write_set_sync_ms,
+                    plan_ms,
+                    move_remap_enqueue_ms,
+                    reclaim_accounting_ms,
+                    other_ms,
+                    forward_waits,
+                )
             return n_moves
 
     def _commit_move_batch(
@@ -2822,6 +2970,22 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.bind_peer(self.mamba_allocator)
         self.mamba_allocator.bind_peer(self.full_attn_allocator)
 
+        state = self.get_memory_snapshot()
+        usable_bytes = (
+            state["full_span_bytes"]
+            + state["mamba_span_bytes"]
+            + state["shared_gap_bytes"]
+        )
+        reserved_bytes = max(0, state["total_bytes"] - usable_bytes)
+        logger.info(
+            "[unified-memory] initialized | usable memory=%.2f GiB | "
+            "system reserved=%.1f MiB | one Mamba slot=%.1f MiB=%d KV tokens",
+            usable_bytes / (1 << 30),
+            reserved_bytes / (1 << 20),
+            self.mamba_allocator.entry_bytes_per_page / (1 << 20),
+            self.mamba_slot_full_token_cost(),
+        )
+
         # The mamba slot allocator (PHYSICAL view) is built later by
         # `init_unified_mamba_pools`, which wraps `self.mamba_allocator` in a
         # `UnifiedMambaSlotAllocator` owning the v2p translate; the mamba pool is a
@@ -2906,6 +3070,54 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         allocator = self.mamba_allocator
         return len(allocator.free_virtual_ids) * allocator.page_size
 
+    def get_memory_snapshot(self) -> Dict[str, int]:
+        """Return a sync-free snapshot of the shared FULL/MAMBA byte pool.
+
+        ``available_now`` is immediately allocatable. ``available_schedulable``
+        additionally credits drainable holes in the peer. ``virtual_free`` is
+        the independent ID-space limit and cannot be increased by reclaiming
+        shared bytes.
+        """
+        full = self.full_attn_allocator
+        mamba = self.mamba_allocator
+        full_hole_pages = int(full._free_phys_pages.numel())
+        mamba_hole_pages = int(mamba._free_phys_pages.numel())
+        full_pending_pages = len(full._pending_reuse_pages_cpu)
+        mamba_pending_pages = len(mamba._pending_reuse_pages_cpu)
+
+        # Only host counters and tensor shapes are read here. Batch logging must
+        # never introduce a device synchronization into the scheduler loop.
+        return {
+            "total_bytes": self.unified_buffer.total_bytes,
+            "shared_gap_bytes": full._current_gap_bytes(),
+            "full_span_bytes": full._allocated_pages()
+            * full.entry_bytes_per_page,
+            "mamba_span_bytes": mamba._allocated_pages()
+            * mamba.entry_bytes_per_page,
+            "full_hole_bytes": full_hole_pages * full.entry_bytes_per_page,
+            "mamba_hole_bytes": mamba_hole_pages * mamba.entry_bytes_per_page,
+            "full_pending_reuse_bytes": full_pending_pages
+            * full.entry_bytes_per_page,
+            "mamba_pending_reuse_bytes": mamba_pending_pages
+            * mamba.entry_bytes_per_page,
+            "full_live_tokens": full.allocated_count(),
+            "mamba_live_slots": mamba.allocated_count(),
+            "full_available_now_tokens": full.available_size(),
+            "mamba_available_now_slots": mamba.available_size(),
+            "full_available_schedulable_tokens": full.schedulable_available_size(),
+            "mamba_available_schedulable_slots": mamba.schedulable_available_size(),
+            "full_virtual_free_tokens": self.full_virtual_available_size(),
+            "mamba_virtual_free_slots": self.mamba_virtual_available_size(),
+            "full_virtual_capacity_tokens": (
+                full.num_pages - full.min_page_index
+            )
+            * full.page_size,
+            "mamba_virtual_capacity_slots": (
+                mamba.num_pages - mamba.min_page_index
+            )
+            * mamba.page_size,
+        }
+
     def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
         """Keep the transient Mamba checkpoint slot available during decode."""
         if not tree_cache.supports_mamba():
@@ -2943,9 +3155,51 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.mamba_allocator.max_slots - 1
 
     def debug_print(self) -> str:
+        state = self.get_memory_snapshot()
+        gib = 1 << 30
+        gap_percent = (
+            state["shared_gap_bytes"] / state["total_bytes"] * 100
+            if state["total_bytes"] > 0
+            else 0.0
+        )
         return (
-            f"#full-available={self.full_attn_allocator.available_size()}, "
-            f"#mamba-available={self.mamba_allocator.available_size()}"
+            "unified_memory={"
+            f"total_capacity_gibibytes={state['total_bytes'] / gib:.2f}, "
+            "unassigned_shared_memory_bytes="
+            f"{state['shared_gap_bytes']}, "
+            "unassigned_shared_memory_gibibytes="
+            f"{state['shared_gap_bytes'] / gib:.2f}, "
+            f"unassigned_shared_memory_percentage={gap_percent:.1f}, "
+            "full_attention_kv_cache={"
+            "currently_allocatable_tokens="
+            f"{state['full_available_now_tokens']}, "
+            "allocatable_tokens_after_peer_compaction="
+            f"{state['full_available_schedulable_tokens']}, "
+            "unused_virtual_token_identifiers="
+            f"{state['full_virtual_free_tokens']}, "
+            f"virtual_token_capacity={state['full_virtual_capacity_tokens']}, "
+            f"allocated_tokens={state['full_live_tokens']}, "
+            f"reserved_physical_region_bytes={state['full_span_bytes']}, "
+            "free_bytes_inside_reserved_region="
+            f"{state['full_hole_bytes']}, "
+            "bytes_waiting_for_safe_reuse="
+            f"{state['full_pending_reuse_bytes']}"
+            "}, "
+            "mamba_state_cache={"
+            "currently_allocatable_slots="
+            f"{state['mamba_available_now_slots']}, "
+            "allocatable_slots_after_peer_compaction="
+            f"{state['mamba_available_schedulable_slots']}, "
+            "unused_virtual_slot_identifiers="
+            f"{state['mamba_virtual_free_slots']}, "
+            f"virtual_slot_capacity={state['mamba_virtual_capacity_slots']}, "
+            f"allocated_slots={state['mamba_live_slots']}, "
+            f"reserved_physical_region_bytes={state['mamba_span_bytes']}, "
+            "free_bytes_inside_reserved_region="
+            f"{state['mamba_hole_bytes']}, "
+            "bytes_waiting_for_safe_reuse="
+            f"{state['mamba_pending_reuse_bytes']}"
+            "}}"
         )
 
     def get_kvcache(self):
