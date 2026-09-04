@@ -595,6 +595,8 @@ class SchedulerMetricsReporter:
             f"Mamba pool={mamba_percent:.1f}%, "
             f"shared gap={gap_percent:.1f}% "
             f"({state['shared_gap_bytes'] / mib:.1f} MiB)",
+            f"in use: KV={state['full_live_tokens']} tokens, "
+            f"Mamba={state['mamba_live_slots']} slots",
             f"evictable: KV={pool_stats.full_evictable_size} tokens, "
             f"Mamba={pool_stats.mamba_evictable_size or 0} slots",
         ]

@@ -130,6 +130,8 @@ class TestUnifiedMemoryBatchLogging(unittest.TestCase):
             "full_span_bytes": 7_562_723_328,
             "mamba_span_bytes": 5_729_495_040,
             "shared_gap_bytes": 96_058_368,
+            "full_live_tokens": 273_088,
+            "mamba_live_slots": 97,
         }
         scheduler = types.SimpleNamespace(
             token_to_kv_pool_allocator=types.SimpleNamespace(
@@ -150,6 +152,7 @@ class TestUnifiedMemoryBatchLogging(unittest.TestCase):
             [
                 "unified memory: KV cache=56.5%, Mamba pool=42.8%, "
                 "shared gap=0.7% (91.6 MiB)",
+                "in use: KV=273088 tokens, Mamba=97 slots",
                 "evictable: KV=512 tokens, Mamba=3 slots",
             ],
         )
@@ -172,6 +175,8 @@ class TestUnifiedMemoryBatchLogging(unittest.TestCase):
                     "full_span_bytes": 7_562_723_328,
                     "mamba_span_bytes": 5_729_495_040,
                     "shared_gap_bytes": 96_058_368,
+                    "full_live_tokens": 273_088,
+                    "mamba_live_slots": 97,
                 },
             ),
             pool_stats_observer=types.SimpleNamespace(
@@ -210,6 +215,7 @@ class TestUnifiedMemoryBatchLogging(unittest.TestCase):
             "shared gap=0.7% (91.6 MiB)",
             output,
         )
+        self.assertIn("in use: KV=273088 tokens, Mamba=97 slots", output)
         self.assertIn("evictable: KV=512 tokens, Mamba=3 slots", output)
         self.assertIn("input throughput=", output)
         self.assertIn("tokens/s", output)
