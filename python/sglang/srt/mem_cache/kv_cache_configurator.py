@@ -185,6 +185,51 @@ def _pp_local_per_request_bytes(
     return total_bytes // len(layer_ids) * local_layer_count
 
 
+def _compute_unified_mamba_request_capacity(
+    *,
+    total_bytes: int,
+    full_token_bytes: int,
+    draft_token_bytes: int,
+    fixed_shared_bytes: int,
+    shared_bytes_per_request: int,
+    fixed_external_bytes: int,
+    external_bytes_per_request: int,
+) -> int:
+    """Return the number of requests that can coexist in unified memory.
+
+    The draft KV pool grows with the target KV capacity. Therefore each byte
+    reserved inside the target's shared pool costs ``(full + draft) / full``
+    bytes in the complete target+draft memory budget.
+    """
+    if full_token_bytes <= 0:
+        raise ValueError("full_token_bytes must be positive")
+
+    total_token_bytes = full_token_bytes + draft_token_bytes
+    scaled_fixed_shared_bytes = (
+        fixed_shared_bytes * total_token_bytes + full_token_bytes - 1
+    ) // full_token_bytes
+    scaled_shared_bytes_per_request = (
+        shared_bytes_per_request * total_token_bytes + full_token_bytes - 1
+    )
+    scaled_shared_bytes_per_request //= full_token_bytes
+    fixed_bytes = fixed_external_bytes + scaled_fixed_shared_bytes
+    bytes_per_request = (
+        external_bytes_per_request + scaled_shared_bytes_per_request
+    )
+    if bytes_per_request <= 0:
+        raise ValueError("bytes_per_request must be positive")
+    return max(0, (total_bytes - fixed_bytes) // bytes_per_request)
+
+
+def _limit_unified_max_running_requests(
+    *, requested: Optional[int], capacity: int, attn_dp_size: int
+) -> int:
+    """Apply a user request limit after converting it to one DP worker."""
+    if requested is None:
+        return capacity
+    return min(requested // attn_dp_size, capacity)
+
+
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.mem_cache.unified_memory_pool import (
@@ -459,6 +504,7 @@ class KVCacheConfigurator:
                         "attention pool. Drop --enable-unified-memory or run "
                         "without PD disaggregation."
                     )
+                assert sizes.unified_total_bytes is not None
                 bundle = self._init_unified_mamba_pools(
                     max_num_reqs=sizes.max_running_requests,
                     max_total_num_tokens=sizes.max_total_num_tokens,
@@ -617,7 +663,7 @@ class KVCacheConfigurator:
         *,
         max_num_reqs: int,
         max_total_num_tokens: int,
-        unified_total_bytes: Optional[int] = None,
+        unified_total_bytes: int,
     ) -> UnifiedPoolBundle:
         """Build the shared-KV-pool stack for a hybrid-Mamba model:
         one byte buffer split between the full-attn MHA KV pool and the
@@ -670,7 +716,6 @@ class KVCacheConfigurator:
             model_context_len=self.model_config.context_len,
             extra_max_context_len=extra_max_context_len,
             max_total_num_tokens=max_total_num_tokens,
-            max_mamba_cache_size=get_schedule().max_mamba_cache_size,
             max_num_reqs=max_num_reqs,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
@@ -682,16 +727,13 @@ class KVCacheConfigurator:
                 if get_disagg().disaggregation_mode == "decode"
                 else 0
             ),
-            mamba_full_memory_ratio=get_schedule().mamba_full_memory_ratio,
             # Overlap mode: the allocator's `free` drops a wait_stream(forward_stream)
             # barrier so eager compaction serializes after the in-flight forward's
             # v2p/KV reads. Near-no-op in normal mode.
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, env-var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
-            # Draft workers keep the token-count byte sum (spec is asserted
-            # off under unified; belt only).
-            unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
+            unified_total_bytes=unified_total_bytes,
         )
         return bundle
 
@@ -2038,7 +2080,10 @@ class KVCacheConfigurator:
             mm_feature_transport=get_mm().mm_feature_transport,
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
-        if self.mambaish_config is not None:
+        if (
+            self.mambaish_config is not None
+            and not self._uses_unified_full_mamba_pool()
+        ):
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
         # Loaded weights (target + draft) can exceed the static budget
@@ -2092,6 +2137,237 @@ class KVCacheConfigurator:
 
         return base + additional_ratio
 
+    def _uses_unified_full_mamba_pool(self) -> bool:
+        return (
+            get_memory().enable_unified_memory
+            and self.mambaish_config is not None
+            and not self.is_hybrid_swa
+            and not self.is_draft_worker
+        )
+
+    def _max_pp_layer_count(self, layer_ids: list[int]) -> int:
+        if self.ps.pp_size == 1:
+            return len(layer_ids)
+        return max(
+            sum(start <= layer_id < end for layer_id in layer_ids)
+            for start, end in (
+                get_pp_indices(
+                    self.model_config.num_hidden_layers, rank, self.ps.pp_size
+                )
+                for rank in range(self.ps.pp_size)
+            )
+        )
+
+    def _unified_full_mamba_entry_bytes(self) -> tuple[int, int]:
+        """Return worst-PP-stage bytes for one full token and one Mamba slot."""
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            MHASubPoolSpec,
+            MLASubPoolSpec,
+            _store_dtype_for,
+        )
+
+        config = self.mambaish_config
+        assert config is not None
+        full_layers = self._max_pp_layer_count(config.full_attention_layer_ids)
+        store_dtype = _store_dtype_for(self.kv_cache_dtype)
+        if self.use_mla_backend:
+            full_spec = MLASubPoolSpec(
+                name="full",
+                layer_num=full_layers,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                store_dtype=store_dtype,
+                grow_direction="down",
+            )
+        else:
+            full_spec = MHASubPoolSpec(
+                name="full",
+                layer_num=full_layers,
+                head_num=self.model_config.get_num_kv_heads(
+                    get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                ),
+                head_dim=self.model_config.head_dim,
+                store_dtype=store_dtype,
+                grow_direction="down",
+            )
+
+        mamba_layers = config.mamba2_cache_params.layers
+        if self.ps.pp_size == 1:
+            mamba_slot_bytes = config.mamba2_cache_params.mamba_cache_per_req
+        else:
+            mamba_slot_bytes = max(
+                _pp_local_per_request_bytes(
+                    config.mamba2_cache_params.mamba_cache_per_req,
+                    mamba_layers,
+                    *get_pp_indices(
+                        self.model_config.num_hidden_layers, rank, self.ps.pp_size
+                    ),
+                )
+                for rank in range(self.ps.pp_size)
+            )
+        return full_spec.entry_bytes(), mamba_slot_bytes
+
+    def _resolve_unified_full_mamba_config(
+        self, available_bytes: int
+    ) -> MemoryPoolConfig:
+        """Resolve one dynamic FULL+Mamba budget and its safe request limit."""
+        from sglang.srt.model_executor.pool_configurator import (
+            _dflash_draft_cell_size,
+        )
+
+        full_token_bytes, mamba_slot_bytes = (
+            self._unified_full_mamba_entry_bytes()
+        )
+        draft_token_bytes = _dflash_draft_cell_size(self)
+        draft_tokens = get_spec().speculative_num_draft_tokens or 0
+        extra_request_slots = (
+            get_disagg().disaggregation_decode_extra_slots
+            if get_disagg().disaggregation_mode == "decode"
+            else 0
+        )
+
+        full_page_bytes = self.page_size * full_token_bytes
+        request_row_bytes = (
+            (self.model_config.context_len + 4 + draft_tokens)
+            * torch.int32.itemsize
+            + torch.int32.itemsize  # request -> Mamba slot mapping
+        )
+        if mamba_extra_buffer_enabled():
+            ping_pong_slots = 1 if get_schedule().disable_overlap_schedule else 2
+            request_row_bytes += ping_pong_slots * torch.int64.itemsize
+
+        if get_memory().disable_radix_cache:
+            mamba_slots_per_request = 1
+            runtime_headroom_slots = 0
+        else:
+            # The old ratio included one temporary replacement slot per request.
+            # Unified memory needs only one such slot globally at runtime.
+            mamba_slots_per_request = max(1, self._calculate_mamba_ratio() - 1)
+            runtime_headroom_slots = 1
+
+        reserved_floor_bytes = max(full_page_bytes, mamba_slot_bytes)
+        # Each allocator rounds the common slot-0 floor to its own page size.
+        slot_zero_bytes = max(
+            (reserved_floor_bytes + full_page_bytes - 1)
+            // full_page_bytes
+            * full_page_bytes,
+            (reserved_floor_bytes + mamba_slot_bytes - 1)
+            // mamba_slot_bytes
+            * mamba_slot_bytes,
+        )
+        shared_bytes_per_request = (
+            full_page_bytes + mamba_slots_per_request * mamba_slot_bytes
+        )
+        fixed_shared_bytes = (
+            slot_zero_bytes
+            + runtime_headroom_slots * mamba_slot_bytes
+            + extra_request_slots * shared_bytes_per_request
+        )
+        speculative_bytes_per_request = draft_tokens * mamba_slot_bytes
+        # Unified views need one tail page; the draft pool may round up one page
+        # and allocates one more padding page.
+        pool_padding_bytes = (
+            full_page_bytes + 2 * self.page_size * draft_token_bytes
+        )
+        fixed_external_bytes = (
+            pool_padding_bytes
+            + (extra_request_slots + 1) * request_row_bytes
+            + speculative_bytes_per_request  # speculative padding row
+        )
+        external_bytes_per_request = (
+            request_row_bytes + speculative_bytes_per_request
+        )
+        capacity = _compute_unified_mamba_request_capacity(
+            total_bytes=available_bytes,
+            full_token_bytes=full_token_bytes,
+            draft_token_bytes=draft_token_bytes,
+            # The shared buffer is aligned down to 4 KiB after the split.
+            fixed_shared_bytes=fixed_shared_bytes + 4095,
+            shared_bytes_per_request=shared_bytes_per_request,
+            fixed_external_bytes=fixed_external_bytes,
+            external_bytes_per_request=external_bytes_per_request,
+        )
+        max_num_reqs = _limit_unified_max_running_requests(
+            requested=self.server_args.max_running_requests,
+            capacity=capacity,
+            attn_dp_size=self.ps.attn_dp_size,
+        )
+        if max_num_reqs <= 0:
+            raise RuntimeError(
+                "Unified memory cannot fit one FULL+Mamba request. Increase "
+                "--mem-fraction-static or reduce speculative decoding memory."
+            )
+
+        external_bytes = (
+            pool_padding_bytes
+            + (max_num_reqs + extra_request_slots + 1) * request_row_bytes
+            + (max_num_reqs + 1) * speculative_bytes_per_request
+        )
+        # The draft pool spans the shared FULL allocator's virtual ID space, so
+        # split this last budget in the same full:draft bytes-per-token ratio.
+        token_pool_bytes = available_bytes - external_bytes
+        unified_total_bytes = (
+            token_pool_bytes
+            * full_token_bytes
+            // (full_token_bytes + draft_token_bytes)
+        )
+        unified_total_bytes -= unified_total_bytes % 4096
+
+        reserved_full_pages = (
+            reserved_floor_bytes + full_page_bytes - 1
+        ) // full_page_bytes
+        full_page_capacity = unified_total_bytes // full_page_bytes
+        full_token_capacity = (
+            max(0, full_page_capacity - reserved_full_pages)
+            * self.page_size
+        )
+        config = self.config_from_budget(
+            token_pool_bytes, cap_tokens=full_token_capacity
+        )
+
+        required_shared_bytes = (
+            fixed_shared_bytes + max_num_reqs * shared_bytes_per_request
+        )
+        if unified_total_bytes < required_shared_bytes:
+            raise RuntimeError(
+                "Unified memory request-capacity calculation is inconsistent: "
+                f"shared pool has {unified_total_bytes} bytes but needs "
+                f"{required_shared_bytes} bytes for {max_num_reqs} requests."
+            )
+
+        config.unified_total_bytes = unified_total_bytes
+        config.max_running_requests = max_num_reqs
+        get_context().override(
+            "unified_memory.max_running_requests",
+            max_running_requests=max_num_reqs * self.ps.attn_dp_size,
+        )
+
+        # The existing Unified Memory log filter applies the configured tp0/all
+        # rank scope to these prefixed messages.
+        logger.warning(
+            "[unified-memory] --mamba-full-memory-ratio=%s and "
+            "--max-mamba-cache-size=%s are ignored because unified memory "
+            "is enabled; they do not partition the pool or limit "
+            "max-running-requests.",
+            self.server_args.mamba_full_memory_ratio,
+            self.server_args.max_mamba_cache_size,
+        )
+        requested = self.server_args.max_running_requests
+        requested_per_worker = (
+            "auto" if requested is None else requested // self.ps.attn_dp_size
+        )
+        logger.info(
+            "[unified-memory] max running requests per DP worker: "
+            "requested=%s, capacity=%d, effective=%d | reserve per request: "
+            "KV=1 page, Mamba=%d slots | global Mamba headroom=%d slot",
+            requested_per_worker,
+            capacity,
+            max_num_reqs,
+            mamba_slots_per_request,
+            runtime_headroom_slots,
+        )
+        return config
+
     def _apply_token_constraints(self, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
 
@@ -2137,7 +2413,10 @@ class KVCacheConfigurator:
             max_num_reqs = min(estimated, token_capacity // 2)
 
         capped_by_mamba = False
-        if self.mambaish_config is not None:
+        if (
+            self.mambaish_config is not None
+            and not self._uses_unified_full_mamba_pool()
+        ):
             ratio = self._calculate_mamba_ratio()
             mamba_cap = get_schedule().max_mamba_cache_size // ratio
             if mamba_cap < max_num_reqs:
@@ -2185,10 +2464,13 @@ class KVCacheConfigurator:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
-        config = self.config_from_budget(available_bytes)
-        config.max_running_requests = self.resolve_max_num_reqs(
-            config.max_total_num_tokens
-        )
+        if self._uses_unified_full_mamba_pool():
+            config = self._resolve_unified_full_mamba_config(available_bytes)
+        else:
+            config = self.config_from_budget(available_bytes)
+            config.max_running_requests = self.resolve_max_num_reqs(
+                config.max_total_num_tokens
+            )
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static

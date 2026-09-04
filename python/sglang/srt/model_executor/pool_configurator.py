@@ -71,11 +71,8 @@ class MemoryPoolConfig:
 
     mem_fraction_static: Optional[float] = None
 
-    # Unified pool only: the PROFILED byte budget for the token-granular
-    # sub-pools. Set, the factories size the buffer from it directly instead of
-    # re-summing ratio-derived token counts, which keeps the re-sum's floor
-    # losses out of the buffer; the token counts stay boot labels / conserve
-    # caps. None on the token-capped path -- a user token cap IS the budget.
+    # Unified pool only: the byte budget for the complete shared sub-pool
+    # buffer. The token counts remain boot labels and scheduler caps.
     unified_total_bytes: Optional[int] = None
 
     def __post_init__(self):

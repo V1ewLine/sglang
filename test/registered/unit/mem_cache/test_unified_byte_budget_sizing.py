@@ -15,12 +15,11 @@
 
 Derived properties pinned here:
 
-  * Budget honored EXACTLY: with ``unified_total_bytes`` set, the swa pair's
-    buffer is that many bytes (the mamba pair adds the state pool's bytes on
-    top — the budget is captured AFTER the state carve-out). Sizing from the
-    ratio-derived token counts instead re-introduces the configurator's
-    rounding: the swa split floors the budget by the cell size and then
-    page-aligns EACH side's token count, so the re-sum reconstructs less
+  * Budget honored EXACTLY: with ``unified_total_bytes`` set, the shared buffer
+    is that many bytes. Sizing from ratio-derived token counts instead
+    re-introduces the configurator's rounding: the swa split floors the budget
+    by the cell size and then page-aligns EACH side's token count, so the re-sum
+    reconstructs less
     than the profiled budget by up to about one page of tokens per side.
   * Fallback: without the budget, sizing is the historical token-count re-sum,
     bit-for-bit.

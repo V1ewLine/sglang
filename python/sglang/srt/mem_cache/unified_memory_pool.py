@@ -1179,18 +1179,16 @@ def init_unified_mamba_pools(
     model_context_len: int,
     extra_max_context_len: int,
     max_total_num_tokens: int,
-    max_mamba_cache_size: int,
     max_num_reqs: int,
     enable_memory_saver: bool,
     enable_mamba_extra_buffer: bool,
     speculative_num_draft_tokens: Optional[int],
     disable_overlap_schedule: bool,
     need_sort: bool,
-    mamba_full_memory_ratio: Optional[float] = None,  # informational only
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
     decode_pre_alloc_size: int = 0,
-    unified_total_bytes: Optional[int] = None,
+    unified_total_bytes: int,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.multi_ended_allocator import (
@@ -1239,18 +1237,9 @@ def init_unified_mamba_pools(
         conv_slice_axis=getattr(cp.shape, "conv_slice_axis", 0),
         grow_direction="up",
     )
-    if unified_total_bytes is not None:
-        # PROFILED byte budget for the token side (captured pre-ratio-floor);
-        # the state pool's bytes ride on top. The token counts stay boot
-        # labels / conserve caps -- the runtime split floats.
-        total_bytes = (
-            unified_total_bytes + max_mamba_cache_size * mamba_spec.entry_bytes()
-        )
-    else:
-        total_bytes = (
-            max_total_num_tokens * full_spec.entry_bytes()
-            + max_mamba_cache_size * mamba_spec.entry_bytes()
-        )
+    # This is the complete shared budget. Runtime watermarks decide how much is
+    # FULL KV versus Mamba state; no startup ratio partitions it.
+    total_bytes = unified_total_bytes
     # bs=1 floor: the state slots one running request locks (1 active + 2 radix
     # checkpoints, a FLOOR not headroom) + the slot-0 sink. The token side is
     # not charged -- `TpModelWorker.get_worker_info` already clamps max_req_len
@@ -1377,20 +1366,13 @@ def init_unified_mamba_pools(
             % (full_spec.blocks_per_page(), shared_pool.view_tail_pad_bytes),
         )
     logger.info(
-        "[unified-memory-pool]   total_bytes=%d, max_total_num_tokens=%d, max_mamba_cache_size=%d, "
+        "[unified-memory-pool]   total_bytes=%d, max_total_num_tokens=%d, "
         "max_num_reqs=%d, speculative_num_draft_tokens=%s",
         total_bytes,
         max_total_num_tokens,
-        max_mamba_cache_size,
         max_num_reqs,
         speculative_num_draft_tokens,
     )
-    if mamba_full_memory_ratio is not None:
-        logger.info(
-            "[unified-memory-pool]   mamba_full_memory_ratio=%s governs the total budget only, "
-            "not the runtime split.",
-            mamba_full_memory_ratio,
-        )
     logger.info(
         "[unified-memory-pool] ============================================================"
     )
